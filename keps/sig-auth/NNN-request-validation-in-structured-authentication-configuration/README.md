@@ -124,6 +124,19 @@ requestInfoValidation:
   message: "Invalid authentication method or untrusted certificate issuer"
 ```
 
+#### Story 3
+
+As a cluster administrator, I want to restrict certificate-based authentication to only local IP addresses while allowing other authentication methods from remote addresses, ensuring that X.509 certificate communication between API server and etcd is limited to localhost while external clients can use token-based authentication.
+
+Example configuration:
+```yaml
+apiVersion: apiserver.config.k8s.io/v1beta1
+kind: AuthenticationConfiguration
+requestValidationRules:
+- expression: 'request.Header.Authorization.Scheme != "" || request.RemoteIP.startsWith("127.0.0.1") || request.RemoteIP.startsWith("::1")'
+  message: "Certificate-based authentication only allowed from localhost"
+```
+
 ### Notes/Constraints/Caveats (Optional)
 
 - CEL expressions for request validation have access to a comprehensive set of request attributes
