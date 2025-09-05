@@ -1,4 +1,4 @@
-# KEP-NNNN: X.509 Certificate Authentication in StructuredAuthenticationConfiguration
+# KEP-NNNN: Request Validation in StructuredAuthenticationConfiguration
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -60,76 +60,75 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
-This KEP proposes adding support for X.509 certificate authentication configuration within the StructuredAuthenticationConfiguration API. This enhancement extends the existing structured authentication framework to include certificate-based authentication with CEL (Common Expression Language) validation rules for both request-level and user-level validation.
+This KEP proposes adding a generic request validation layer to the StructuredAuthenticationConfiguration API. This enhancement introduces a new `RequestInfoValidation` field that allows administrators to configure CEL (Common Expression Language) validation rules that are applied to all authentication requests, regardless of the authentication method used.
 
-The proposal introduces a new `X509` field in the `AuthenticationConfiguration` that allows administrators to configure certificate authentication with fine-grained control over certificate validation, issuer constraints, and custom validation logic using CEL expressions.
+The proposal introduces a new authentication layer that wraps existing authenticators and provides fine-grained control over request validation based on request attributes such as remote IP, headers, certificate information, and other request metadata.
 
 ## Motivation
 
-Currently, X.509 certificate authentication in Kubernetes is configured through command-line flags and lacks the flexibility and expressiveness provided by the StructuredAuthenticationConfiguration framework. This creates inconsistencies in how different authentication methods are configured and limits the ability to apply advanced validation rules to certificate-based authentication.
+Currently, Kubernetes authentication methods lack a unified way to apply request-level validation rules across different authentication mechanisms. Each authentication method (JWT, X.509, etc.) has its own validation logic, and there's no consistent way to apply common security policies like IP address restrictions, header validation, or certificate issuer checks across all authentication methods.
 
-The existing certificate authentication mechanism has several limitations:
-- Limited configurability compared to other authentication methods like JWT
-- No support for custom validation rules beyond basic certificate chain validation
-- Lack of runtime configurability and dynamic validation capabilities
+The existing authentication framework has several limitations:
+- No unified request validation layer across authentication methods
+- Limited ability to apply security policies based on request metadata
+- Lack of runtime configurability for request validation rules
+- No support for custom validation logic beyond what each authenticator provides
 
 ### Goals
 
-- Extend StructuredAuthenticationConfiguration to support X.509 certificate authentication
-- Provide CEL-based validation rules for request-level validation (e.g., IP address restrictions)
-- Provide CEL-based validation rules for user-level validation after certificate validation
-- Maintain backward compatibility with existing certificate authentication mechanisms
-- Enable fine-grained control over certificate issuer validation
-- Support multiple certificate authentication configurations within a single cluster
+- Introduce a generic request validation layer that works with any authentication method
+- Provide CEL-based validation rules for request-level validation (e.g., IP address restrictions, header validation)
+- Enable fine-grained control over request attributes and metadata
+- Maintain backward compatibility with existing authentication mechanisms
+- Support multiple request validation rules within a single cluster
+- Allow validation based on certificate information when available
 
 ### Non-Goals
 
-- Replace the existing command-line flag-based certificate authentication (backward compatibility must be maintained)
-- Change the fundamental certificate chain validation process
+- Replace existing authentication methods or their specific validation logic
+- Change the fundamental authentication flow or user validation process
+- Provide authorization capabilities (this is purely authentication-focused)
 
 ## Proposal
 
-This proposal adds X.509 certificate authentication support to StructuredAuthenticationConfiguration by introducing new API types and extending the existing authentication framework.
+This proposal adds a generic request validation layer to StructuredAuthenticationConfiguration by introducing new API types and extending the existing authentication framework with a wrapper authenticator.
 
 ### User Stories (Optional)
 
 #### Story 1
 
-As a cluster administrator, I want to configure certificate authentication with IP address restrictions so that certificates can only be used from specific network ranges, enhancing the security posture of my cluster.
+As a cluster administrator, I want to restrict authentication requests to specific IP address ranges across all authentication methods, so that I can ensure all authentication attempts come from trusted networks regardless of whether users authenticate via JWT, certificates, or other methods.
 
 Example configuration:
 ```yaml
 apiVersion: apiserver.config.k8s.io/v1beta1
 kind: AuthenticationConfiguration
-x509:
+requestInfoValidation:
+- expression: 'request.RemoteIP.startsWith("10.0.0.") || request.RemoteIP.startsWith("192.168.")'
+  message: "Authentication only allowed from internal networks"
+jwt:
 - issuer:
-    name: "my-ca"
-  requestValidationRules:
-  - expression: 'request.remoteaddr.startsWith("10.0.0.")'
-    message: "Certificate authentication only allowed from internal network"
+    url: "https://example.com"
 ```
 
 #### Story 2
 
-As a cluster administrator, I want to apply custom validation rules to users authenticated via certificates, such as ensuring certain user attributes are present or meet specific criteria before allowing access.
+As a cluster administrator, I want to apply different validation rules based on the authentication method being used, such as requiring specific certificate issuers for certificate-based authentication while allowing broader access for JWT authentication.
 
 Example configuration:
 ```yaml
 apiVersion: apiserver.config.k8s.io/v1beta1
 kind: AuthenticationConfiguration
-x509:
-- issuer:
-    name: "my-ca"
-  userValidationRules:
-  - expression: 'user.username.startsWith("system:")'
-    message: "User must be a system user or member of developers group"
+requestInfoValidation:
+- expression: 'request.Header.Authorization.Scheme == "Bearer" || (request.CertificateIssuerName != "" && request.CertificateIssuerName == "trusted-ca")'
+  message: "Invalid authentication method or untrusted certificate issuer"
 ```
 
 ### Notes/Constraints/Caveats (Optional)
 
-- CEL expressions for request validation have access to a limited set of request attributes (initially just remote address)
-- The certificate issuer name matching is based on the Common Name field of the certificate issuer
-- User validation rules are evaluated after successful certificate authentication
+- CEL expressions for request validation have access to a comprehensive set of request attributes
+- The request validation layer is applied after successful authentication but before returning the user info
+- Certificate information is only available when certificate-based authentication is used
 - The feature requires the StructuredAuthenticationConfiguration feature gate to be enabled
 
 ### Risks and Mitigations
@@ -140,87 +139,108 @@ x509:
 **Risk**: Misconfigured validation rules could lock out legitimate users
 **Mitigation**: Validation rules will be optional, and the system will fail open if CEL evaluation encounters errors (with appropriate logging).
 
+**Risk**: Performance impact from CEL evaluation on every authentication request
+**Mitigation**: CEL expressions are compiled once at startup and cached. The evaluation overhead is minimal for simple expressions.
+
 ## Design Details
 
 The implementation introduces several new API types:
 
 ```go
-type X509AuthConfig struct {
-    Issuer                 CertIssuer              `json:"issuer,omitempty"`
-    RequestValidationRules []RequestValidationRule `json:"requestValidationRules,omitempty"`
-    UserValidationRules    []UserValidationRule    `json:"userValidationRules,omitempty"`
-}
-
-type CertIssuer struct {
-    Name string `json:"name,omitempty"`
-}
-
 type RequestValidationRule struct {
-    Expression string `json:"expression,omitempty"`
-    Message    string `json:"message,omitempty"`
+    Expression string `json:"expression"`
+    Message    string `json:"message"`
 }
 ```
 
 The `AuthenticationConfiguration` is extended with:
 ```go
 type AuthenticationConfiguration struct {
-    JWT  []JWTAuthenticator `json:"jwt"`
-    X509 []X509AuthConfig   `json:"x509,omitempty"`  // New field
-    Anonymous *AnonymousAuthConfig `json:"anonymous,omitempty"`
+    JWT                    []JWTAuthenticator      `json:"jwt"`
+    RequestInfoValidation  []RequestValidationRule `json:"requestInfoValidation,omitempty"`  // New field
+    Anonymous              *AnonymousAuthConfig    `json:"anonymous,omitempty"`
 }
 ```
 
+### Request Validation Layer Architecture
+
+The request validation layer is implemented as a wrapper authenticator that:
+
+1. Receives authentication requests
+2. Delegates to the underlying authenticator (JWT, X.509, etc.)
+3. If authentication succeeds, evaluates CEL validation rules against request metadata
+4. Returns the authentication result only if all validation rules pass
+
 ### CEL Environment
 
-Request validation rules have access to a `request` variable with the following structure:
+Request validation rules have access to a `request` variable with the following structure (TBD open to suggestions):
 ```
-request.remoteaddr (string) - The remote IP address of the client
+request.RemoteIP (string) - The remote IP address of the client
+request.RemotePort (string) - The remote port of the client
+request.Header.Host (string) - The Host header value
+request.Header.UserAgent (string) - The User-Agent header value
+request.Header.Authorization.Scheme (string) - The authorization scheme (Bearer, Basic, etc.)
+request.CertificateIssuerName (string) - The certificate issuer name (when available)
 ```
 
-User validation rules have access to a `user` variable with the standard UserInfo structure:
-```
-user.username (string) - The username from the certificate
-user.uid (string) - The user ID
-user.groups ([]string) - The user's groups
-user.extra (map[string][]string) - Additional user attributes
-```
+### Implementation Details
+
+The request validation layer is implemented in a new package:
+`k8s.io/apiserver/pkg/authentication/request/requestvalidation`
+
+Key components:
+- `RequestValidator` struct that wraps any authenticator
+- `RequestInfo` type that represents the CEL-accessible request data
+- CEL compilation and evaluation logic
+- Integration with the existing authentication configuration system
 
 ### Test Plan
 
 #### Prerequisite testing updates
 
-- Update existing certificate authentication tests to ensure backward compatibility
+- Update existing authentication tests to ensure backward compatibility
 - Add CEL compiler validation tests for the new expression types
 
 #### Unit tests
 
 New unit tests will cover:
-- X509AuthConfig validation logic
+- RequestValidationRule validation logic
 - CEL expression compilation and evaluation
-- Request and user validation rule processing
+- Request validation rule processing
+- Integration with different authenticator types
 
 #### Integration tests
 
+Integration tests will verify:
+- TBD
+
 #### e2e tests
+
+E2e tests will validate:
+- TBD
 
 ### Graduation Criteria
 
 #### Alpha
 
-- Feature implemented behind the StructuredAuthenticationConfiguration feature flag
-- Basic X.509 authentication with CEL validation rules working
+- Feature implemented behind the StructuredAuthenticationConfiguration feature gate
+- Basic request validation with CEL validation rules working
 - Unit and integration tests completed and enabled
 - API validation ensures only valid CEL expressions are accepted
 
 #### Beta
 
+- TBD
+
 #### GA
+
+- TBD
 
 ### Upgrade / Downgrade Strategy
 
-The feature is additive and does not modify existing authentication behavior. Clusters can be upgraded with the feature disabled, and existing certificate authentication will continue to work unchanged.
+The feature is additive and does not modify existing authentication behavior. Clusters can be upgraded with the feature disabled, and existing authentication will continue to work unchanged.
 
-When downgrading, the X509 configuration in StructuredAuthenticationConfiguration will be ignored, and certificate authentication will fall back to the existing command-line flag configuration.
+When downgrading, the RequestValidationRules configuration in StructuredAuthenticationConfiguration will be ignored, and authentication will fall back to the existing behavior without request validation.
 
 ### Version Skew Strategy
 
@@ -238,15 +258,15 @@ This feature only affects the API server component. No coordination with other c
 
 ###### Does enabling the feature change any default behavior?
 
-No. The feature only adds new configuration options. Existing certificate authentication behavior remains unchanged when the feature is enabled but not configured.
+No. The feature only adds new configuration options. Existing authentication behavior remains unchanged when the feature is enabled but not configured.
 
 ###### Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?
 
-Yes. Disabling the StructuredAuthenticationConfiguration feature gate will cause the API server to ignore X509 configuration in StructuredAuthenticationConfiguration and fall back to existing certificate authentication mechanisms.
+Yes. Disabling the StructuredAuthenticationConfiguration feature gate will cause the API server to ignore RequestValidationRules configuration and fall back to existing authentication mechanisms without request validation.
 
 ###### What happens if we reenable the feature if it was previously rolled back?
 
-The X509 configuration in StructuredAuthenticationConfiguration will be processed again, and certificate authentication will use the configured validation rules.
+The RequestValidationRules configuration will be processed again, and authentication will use the configured validation rules.
 
 ###### Are there any tests for feature enablement/disablement?
 
@@ -256,9 +276,18 @@ Yes. Unit tests will verify that the feature can be enabled and disabled, and th
 
 ###### How can a rollout or rollback fail? Can it impact already running workloads?
 
+A rollout could fail if:
+- CEL expressions are malformed and prevent API server startup
+- Validation rules are too restrictive and block legitimate authentication
+
+Impact on running workloads is minimal since this only affects new authentication requests.
+
 ###### What specific metrics should inform a rollback?
 
+
 ###### Were upgrade and rollback tested? Was the upgrade->downgrade->upgrade path tested?
+
+Testing will include upgrade/downgrade scenarios to ensure configuration is properly ignored when the feature is disabled.
 
 ###### Is the rollout accompanied by any deprecations and/or removals of features, APIs, fields of API types, flags, etc.?
 
@@ -268,11 +297,14 @@ No deprecations or removals are included in this rollout.
 
 ###### How can an operator determine if the feature is in use by workloads?
 
-- Check if X509 configuration is present in StructuredAuthenticationConfiguration
-- Monitor authentication metrics filtered by authenticator type
-- Review API server logs for X509 CEL evaluation messages
+- Check if RequestValidationRules configuration is present in StructuredAuthenticationConfiguration
+- Monitor authentication metrics for request validation failures
+- Review API server logs for request validation messages
 
 ###### How can someone using this feature know that it is working for their instance?
+
+- Authentication requests that should be blocked by validation rules are rejected
+- API server logs show request validation evaluation messages
 
 ###### What are the reasonable SLOs (Service Level Objectives) for the enhancement?
 
@@ -297,9 +329,7 @@ No new API calls are generated by this feature.
 ###### Will enabling / using this feature result in introducing new API types?
 
 Yes, new API types are introduced:
-- X509AuthConfig
-- CertIssuer  
-- RequestValidationRule (shared with existing JWT authentication)
+- RequestValidationRule
 
 These are configuration types only and do not create persistent objects.
 
@@ -309,11 +339,9 @@ No.
 
 ###### Will enabling / using this feature result in increasing size or count of the existing API objects?
 
-The AuthenticationConfiguration object will increase in size when X509 configuration is added, but this is a single configuration object per API server.
+The AuthenticationConfiguration object will increase in size when RequestValidationRules configuration is added, but this is a single configuration object per API server.
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
-
-Authentication latency may increase slightly due to CEL expression evaluation, but this is expected to be minimal.
 
 ###### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
 
@@ -339,27 +367,28 @@ This feature only affects authentication processing within the API server. If th
 
 - [CEL Expression Runtime Failure]  
   - Detection: Authentication errors in API server logs and metrics
-  - Mitigations: TBD
+  - Mitigations: System fails open with appropriate logging
   - Diagnostics: Runtime CEL evaluation errors logged with expression details
-  - Testing: TBD
+  - Testing: Unit tests cover runtime evaluation failures
 
 ###### What steps should be taken if SLOs are not being met to determine the problem?
 
 ## Implementation History
 
-- 2024-08-25: Initial KEP draft created
-- 2024-08-25: Prototype implementation completed with basic X509 support and CEL validation
+- 2024-09-05: Initial KEP draft created for generic request validation layer
 
 ## Drawbacks
 
 ## Alternatives
 
-1. **Extend existing command-line flags**: Could add more flags for certificate validation, but this would not provide the flexibility of CEL expressions and would continue the inconsistent configuration approach.
+1. **Extend individual authenticators**: Could add validation logic to each authenticator type, but this would duplicate code and create inconsistencies.
 
-2. **Use admission controllers**: Could implement certificate validation logic in admission controllers, would be less efficient.
+2. **Use admission controllers**: Could implement request validation logic in admission controllers, but this would be less efficient and wouldn't prevent authentication.
 
-3. **External authentication webhook**: Could use webhook authentication for certificate validation, but this would add network dependencies and latency to the authentication process.
+3. **External authentication webhook**: Could use webhook authentication for request validation, but this would add network dependencies and latency.
+
+4. **Network policies**: Could use network policies for IP restrictions, but this wouldn't provide the flexibility of CEL expressions or access to request metadata.
 
 ## Infrastructure Needed (Optional)
 
-No additional infrastructure is needed. The implementation uses existing Kubernetes CEL libraries and certificate validation mechanisms.
+No additional infrastructure is needed. The implementation uses existing Kubernetes CEL libraries and authentication mechanisms.
